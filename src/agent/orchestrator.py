@@ -1,156 +1,139 @@
-import logging
 import uuid
-from typing import Dict, Any, Optional
+
 from ..models.lead import (
+    CompanySize,
     LeadInput,
-    AgentLeadState,
+    LeadTier,
+    LeadWorkflowState,
     QualificationScorecard,
-    LeadTier
 )
-from ..models.task import AgentTask, TaskStatus, ApprovalDecision, ApprovalAction
-from ..tools.mcp_client import MCPToolProvider
-from ..tools.crm import CRMConnector
+from ..models.task import AgentTask, ApprovalAction, ApprovalDecision, TaskStatus
 from ..storage.database import InMemoryTaskRepository
+from ..tools.crm import DemoCRMConnector
 
-logger = logging.getLogger(__name__)
 
-class LeadAgentOrchestrator:
-    """
-    Core Autonomous Agent orchestrating lead research, qualification, and routing.
-    Enforces deterministic state transitions, schema validation, and HITL safety gates.
-    """
-    def __init__(self, repository: InMemoryTaskRepository):
+class LeadWorkflowService:
+    """Runs a deterministic lead workflow with an explicit human approval gate."""
+
+    def __init__(self, repository: InMemoryTaskRepository) -> None:
         self.repo = repository
-        self.mcp = MCPToolProvider()
-        self.crm = CRMConnector()
+        self.crm = DemoCRMConnector()
 
-    async def start_pipeline(self, lead_input: LeadInput) -> AgentTask:
-        task_id = f"task_{uuid.uuid4().hex[:10]}"
+    async def start_pipeline(self, lead: LeadInput) -> AgentTask:
         task = AgentTask(
-            task_id=task_id,
+            task_id=f"task_{uuid.uuid4().hex[:10]}",
             status=TaskStatus.QUEUED,
-            payload=lead_input.model_dump()
+            payload=lead.model_dump(),
         )
         await self.repo.save_task(task)
 
-        # Execute pipeline asynchronously
-        await self._run_pipeline(task, lead_input)
+        task.status = TaskStatus.QUALIFYING
+        await self.repo.save_task(task)
+
+        state = self._build_state(lead)
+        task.result = state.model_dump()
+        task.status = (
+            TaskStatus.WAITING_APPROVAL
+            if state.requires_human_approval
+            else TaskStatus.COMPLETED
+        )
+        await self.repo.save_task(task)
         return task
 
-    async def _run_pipeline(self, task: AgentTask, lead: LeadInput) -> None:
-        try:
-            task.status = TaskStatus.RESEARCHING
-            await self.repo.save_task(task)
-            intelligence = await self.mcp.search_company_profile(lead.company_name, lead.website or "")
+    def _build_state(self, lead: LeadInput) -> LeadWorkflowState:
+        budget_scores = {
+            CompanySize.ENTERPRISE: 90,
+            CompanySize.MID_MARKET: 75,
+            CompanySize.SMALL: 55,
+            CompanySize.UNKNOWN: 45,
+        }
+        budget_fit = budget_scores[lead.company_size]
 
-            task.status = TaskStatus.QUALIFYING
-            await self.repo.save_task(task)
+        role = (lead.contact_role or "").lower()
+        decision_maker_terms = ("founder", "owner", "ceo", "cto", "director", "head")
+        authority_fit = 90 if any(term in role for term in decision_maker_terms) else 60 if role else 40
 
-            # Deterministic scoring model
-            budget_fit = 85 if "AI" in lead.company_name or "Cloud" in lead.company_name else 70
-            authority_fit = 90 if any(role in (lead.inquiry_message or "").lower() for role in ["founder", "ceo", "director", "head"]) else 75
-            need_urgency = 88 if lead.inquiry_message and len(lead.inquiry_message) > 40 else 65
+        message = (lead.inquiry_message or "").strip()
+        urgent_terms = ("urgent", "immediately", "deadline", "blocking", "asap")
+        need_urgency = 90 if any(term in message.lower() for term in urgent_terms) else 70 if len(message) >= 80 else 55 if message else 30
 
-            composite = (budget_fit * 0.4) + (authority_fit * 0.3) + (need_urgency * 0.3)
-            
-            if composite >= 80:
-                tier = LeadTier.TIER_1_ENTERPRISE
-            elif composite >= 65:
-                tier = LeadTier.TIER_2_MID_MARKET
-            else:
-                tier = LeadTier.TIER_3_NURTURE
+        composite = round(budget_fit * 0.35 + authority_fit * 0.30 + need_urgency * 0.35, 1)
+        tier = LeadTier.HIGH_PRIORITY if composite >= 80 else LeadTier.QUALIFIED if composite >= 60 else LeadTier.NURTURE
 
-            scorecard = QualificationScorecard(
+        evidence = [f"Company size supplied as {lead.company_size.value}."]
+        if lead.contact_role:
+            evidence.append(f"Contact role supplied as {lead.contact_role}.")
+        if message:
+            evidence.append("An inbound need statement was provided.")
+
+        missing = []
+        if lead.company_size == CompanySize.UNKNOWN:
+            missing.append("company_size")
+        if not lead.contact_role:
+            missing.append("contact_role")
+        if not message:
+            missing.append("inquiry_message")
+
+        requires_approval = tier in (LeadTier.HIGH_PRIORITY, LeadTier.QUALIFIED)
+        drafted_response = (
+            f"Hi {lead.name},\n\n"
+            f"Thank you for contacting us about {lead.company_name}'s workflow needs. "
+            "A team member will review the details and follow up with relevant next steps."
+        )
+
+        return LeadWorkflowState(
+            lead=lead,
+            scorecard=QualificationScorecard(
                 budget_fit=budget_fit,
                 authority_fit=authority_fit,
                 need_urgency=need_urgency,
-                composite_score=round(composite, 1),
+                composite_score=composite,
                 tier=tier,
-                key_reasons=[
-                    f"Identified {len(intelligence.technologies_used)} core modern stack components",
-                    f"Strong ICP signals: {', '.join(intelligence.signals[:2])}"
-                ],
-                suggested_angle=f"Focus on automated {intelligence.industry} workflows with verified ROI."
-            )
-
-            confidence = 0.92 if lead.website else 0.82
-            requires_hitl = (confidence < 0.85) or (tier == LeadTier.TIER_1_ENTERPRISE)
-
-            drafted_outreach = (
-                f"Hi {lead.name},\n\n"
-                f"I noticed {lead.company_name}'s recent initiative to streamline workflows across your {intelligence.industry} operations. "
-                f"We recently deployed an automated orchestration engine that eliminated 30+ manual hours weekly for similar teams.\n\n"
-                f"Would you be open to reviewing the technical architecture breakdown next Tuesday?"
-            )
-
-            state = AgentLeadState(
-                lead=lead,
-                intelligence=intelligence,
-                scorecard=scorecard,
-                drafted_response=drafted_outreach,
-                confidence_score=confidence,
-                requires_human_approval=requires_hitl,
-                approval_status="waiting_review" if requires_hitl else "auto_approved"
-            )
-
-            if requires_hitl:
-                task.status = TaskStatus.WAITING_APPROVAL
-                task.result = state.model_dump()
-                await self.repo.save_task(task)
-                logger.info(f"[HITL Gate] Task {task.task_id} paused for human verification (Tier 1 enterprise lead)")
-            else:
-                await self._finalize_dispatch(task, state)
-
-        except Exception as e:
-            logger.error(f"[Pipeline Error] Task {task.task_id} failed: {str(e)}", exc_info=True)
-            task.status = TaskStatus.FAILED
-            task.error = str(e)
-            await self.repo.save_task(task)
+                evidence=evidence,
+                missing_information=missing,
+            ),
+            drafted_response=drafted_response,
+            requires_human_approval=requires_approval,
+            approval_status="waiting_review" if requires_approval else "not_required",
+        )
 
     async def resolve_approval(self, task_id: str, decision: ApprovalDecision) -> AgentTask:
         task = await self.repo.get_task(task_id)
         if not task:
             raise ValueError(f"Task {task_id} not found")
-
         if task.status != TaskStatus.WAITING_APPROVAL:
-            raise ValueError(f"Task {task_id} is in status '{task.status}', not awaiting approval")
+            raise ValueError(f"Task {task_id} is not awaiting approval")
 
-        state = AgentLeadState.model_validate(task.result)
-
+        state = LeadWorkflowState.model_validate(task.result)
         if decision.action == ApprovalAction.REJECT:
-            task.status = TaskStatus.REJECTED
             state.approval_status = "rejected"
             task.result = state.model_dump()
+            task.status = TaskStatus.REJECTED
             await self.repo.save_task(task)
             return task
 
-        if decision.action == ApprovalAction.MODIFY and decision.edited_draft:
+        if decision.action == ApprovalAction.MODIFY:
+            if not decision.edited_draft:
+                raise ValueError("edited_draft is required for a modify decision")
             state.drafted_response = decision.edited_draft
             state.approval_status = "modified_and_approved"
         else:
             state.approval_status = "approved"
 
-        await self._finalize_dispatch(task, state)
-        return task
-
-    async def _finalize_dispatch(self, task: AgentTask, state: AgentLeadState) -> None:
-        # Sync to CRM
-        crm_res = await self.crm.sync_lead(state.lead.email, {
-            "tier": state.scorecard.tier if state.scorecard else "Unclassified",
-            "score": state.scorecard.composite_score if state.scorecard else 0,
-            "status": "Qualified - Ready for Outreach"
-        })
-        
-        # Dispatch outreach
-        outreach_res = await self.crm.schedule_outreach(
-            state.lead.email, 
-            state.drafted_response or ""
+        crm_result = await self.crm.sync_lead(
+            state.lead.email,
+            {
+                "tier": state.scorecard.tier.value,
+                "score": state.scorecard.composite_score,
+            },
         )
-
+        follow_up_result = await self.crm.queue_follow_up(
+            state.lead.email, state.drafted_response
+        )
+        result = state.model_dump()
+        result["crm_sync"] = crm_result
+        result["follow_up"] = follow_up_result
+        task.result = result
         task.status = TaskStatus.COMPLETED
-        res = state.model_dump()
-        res["crm_sync"] = crm_res
-        res["outreach_status"] = outreach_res
-        task.result = res
         await self.repo.save_task(task)
-        logger.info(f"[Pipeline Complete] Task {task.task_id} fully executed and synchronized")
+        return task

@@ -1,51 +1,76 @@
 import pytest
-from src.models.lead import LeadInput, LeadTier
-from src.models.task import TaskStatus, ApprovalDecision, ApprovalAction
+
+from src.agent.orchestrator import LeadWorkflowService
+from src.models.lead import CompanySize, LeadInput, LeadTier
+from src.models.task import ApprovalAction, ApprovalDecision, TaskStatus
 from src.storage.database import InMemoryTaskRepository
-from src.agent.orchestrator import LeadAgentOrchestrator
 
-@pytest.mark.asyncio
-async def test_lead_pipeline_tier1_hits_approval_gate():
-    repo = InMemoryTaskRepository()
-    orchestrator = LeadAgentOrchestrator(repo)
 
-    lead = LeadInput(
+def enterprise_lead() -> LeadInput:
+    return LeadInput(
         name="Alex Mercer",
-        email="alex@ai-enterprises.com",
-        company_name="AI Global Systems",
-        website="https://aiglobalsystems.com",
-        inquiry_message="Looking to integrate an autonomous orchestration layer for our sales engineering team."
+        email="alex@example.com",
+        company_name="Example Systems",
+        website="https://example.com",
+        company_size=CompanySize.ENTERPRISE,
+        contact_role="Operations Director",
+        inquiry_message="Our admissions workflow is blocking response times and needs an urgent automation review.",
     )
 
-    task = await orchestrator.start_pipeline(lead)
-
-    assert task.status == TaskStatus.WAITING_APPROVAL
-    assert task.result is not None
-    assert task.result["scorecard"]["tier"] == LeadTier.TIER_1_ENTERPRISE
-    assert task.result["requires_human_approval"] is True
 
 @pytest.mark.asyncio
-async def test_human_approval_resolution():
-    repo = InMemoryTaskRepository()
-    orchestrator = LeadAgentOrchestrator(repo)
+async def test_high_priority_lead_waits_for_human_approval():
+    service = LeadWorkflowService(InMemoryTaskRepository())
 
-    lead = LeadInput(
-        name="Sarah Connor",
-        email="sarah@skynet.com",
-        company_name="Cyberdyne AI Systems",
-        website="https://cyberdyne.ai",
-        inquiry_message="Urgent workflow modernization needed."
-    )
+    task = await service.start_pipeline(enterprise_lead())
 
-    task = await orchestrator.start_pipeline(lead)
     assert task.status == TaskStatus.WAITING_APPROVAL
+    assert task.result["scorecard"]["tier"] == LeadTier.HIGH_PRIORITY
+    assert task.result["requires_human_approval"] is True
+    assert "30+" not in task.result["drafted_response"]
 
-    decision = ApprovalDecision(
-        action=ApprovalAction.APPROVE,
-        feedback="Verified legitimacy of enterprise inquiry."
+
+@pytest.mark.asyncio
+async def test_approval_records_demo_integrations_without_network_calls():
+    service = LeadWorkflowService(InMemoryTaskRepository())
+    task = await service.start_pipeline(enterprise_lead())
+
+    resolved = await service.resolve_approval(
+        task.task_id, ApprovalDecision(action=ApprovalAction.APPROVE)
     )
 
-    resolved = await orchestrator.resolve_approval(task.task_id, decision)
     assert resolved.status == TaskStatus.COMPLETED
-    assert resolved.result["crm_sync"]["status"] == "synchronized"
-    assert resolved.result["outreach_status"]["status"] == "queued"
+    assert resolved.result["crm_sync"]["mode"] == "demo"
+    assert resolved.result["follow_up"]["status"] == "queued_for_demo"
+
+
+@pytest.mark.asyncio
+async def test_modify_requires_an_edited_draft():
+    service = LeadWorkflowService(InMemoryTaskRepository())
+    task = await service.start_pipeline(enterprise_lead())
+
+    with pytest.raises(ValueError, match="edited_draft"):
+        await service.resolve_approval(
+            task.task_id, ApprovalDecision(action=ApprovalAction.MODIFY)
+        )
+
+
+@pytest.mark.asyncio
+async def test_incomplete_lead_is_nurtured_without_outreach():
+    service = LeadWorkflowService(InMemoryTaskRepository())
+    lead = LeadInput(
+        name="Sam Lee",
+        email="sam@example.com",
+        company_name="Example Studio",
+    )
+
+    task = await service.start_pipeline(lead)
+
+    assert task.status == TaskStatus.COMPLETED
+    assert task.result["scorecard"]["tier"] == LeadTier.NURTURE
+    assert set(task.result["scorecard"]["missing_information"]) == {
+        "company_size",
+        "contact_role",
+        "inquiry_message",
+    }
+    assert "crm_sync" not in task.result
