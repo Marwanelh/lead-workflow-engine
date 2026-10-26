@@ -1,36 +1,31 @@
-import asyncio
-import logging
-from typing import Dict, Any
+import hashlib
+from typing import Any
 
-logger = logging.getLogger(__name__)
 
-class CRMConnector:
-    """
-    CRM orchestration client supporting idempotent updates and audit logging.
-    """
-    def __init__(self, crm_type: str = "HubSpot"):
-        self.crm_type = crm_type
-        self.audit_log = []
+class DemoCRMConnector:
+    """Local integration boundary. It records intent and never calls an external service."""
 
-    async def sync_lead(self, email: str, properties: Dict[str, Any]) -> Dict[str, Any]:
-        logger.info(f"[CRM Connector] Syncing record for {email} to {self.crm_type}")
-        await asyncio.sleep(0.05)
-        
-        record_id = f"crm_{abs(hash(email)) % 1000000}"
+    def __init__(self) -> None:
+        self.audit_log: list[dict[str, Any]] = []
+
+    async def sync_lead(self, email: str, properties: dict[str, Any]) -> dict[str, Any]:
+        record_id = hashlib.sha256(email.encode()).hexdigest()[:12]
         event = {
-            "crm_id": record_id,
+            "crm_id": f"demo_{record_id}",
             "email": email,
-            "status": "synchronized",
-            "properties": properties
+            "status": "recorded",
+            "mode": "demo",
+            "properties": properties,
         }
         self.audit_log.append(event)
         return event
 
-    async def schedule_outreach(self, email: str, body: str) -> Dict[str, Any]:
-        logger.info(f"[CRM Connector] Queueing automated dispatch for {email}")
-        return {
-            "status": "queued",
+    async def queue_follow_up(self, email: str, body: str) -> dict[str, Any]:
+        event = {
+            "status": "queued_for_demo",
             "recipient": email,
             "body_length": len(body),
-            "dispatch_provider": "SES/SendGrid"
+            "mode": "demo",
         }
+        self.audit_log.append(event)
+        return event

@@ -1,6 +1,6 @@
 import asyncio
 from typing import Dict, Optional, List
-from datetime import datetime
+from datetime import datetime, timezone
 from ..models.task import AgentTask, TaskStatus
 
 class InMemoryTaskRepository:
@@ -13,7 +13,7 @@ class InMemoryTaskRepository:
 
     async def save_task(self, task: AgentTask) -> None:
         async with self._lock:
-            task.updated_at = datetime.utcnow()
+            task.updated_at = datetime.now(timezone.utc)
             self._tasks[task.task_id] = task
 
     async def get_task(self, task_id: str) -> Optional[AgentTask]:
